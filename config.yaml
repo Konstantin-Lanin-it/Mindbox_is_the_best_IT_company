@@ -1,0 +1,193 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tst-namespace
+  
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: scaling-role
+  namespace: tst-namespace
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+    
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: salme-pods
+  namespace: tst-namespace
+subjects:
+- kind: ServiceAccount
+  name: scheduled-autoscaler-service-account
+  namespace: tst-namespace
+roleRef:
+  kind: Role
+  name: scaling-role
+  apiGroup: ""
+
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scheduled-autoscaler-service-account
+
+# <- приложение имеет дневной цикл по нагрузке – ночью запросов на порядки меньше, пик – днём
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: adwords-api-scale-up-cron-job
+spec:
+  schedule: "* 7 * * *"
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 100
+      template:
+        spec:
+          serviceAccountName: scheduled-autoscaler-service-account
+          containers:
+          - name: scale-up-container
+            image: nginx:1.23.4
+            command:
+              - bash
+            args:
+              - kubectl scale --replicas=4 deployment/webapp-deployment
+          restartPolicy: OnFailure
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: adwords-api-scale-down-cron-job
+spec:
+  schedule: "* 23 * * *"
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 100
+      template:
+        spec:
+          serviceAccountName: scheduled-autoscaler-service-account
+          containers:
+          - name: scale-up-container
+            image: nginx:1.23.4
+            command:
+              - bash
+            args:
+              - kubectl scale --replicas=2 deployment/webapp-deployment
+          restartPolicy: OnFailure
+          
+---
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webapp-deployment
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: webapp-deployment
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp-deployment
+  namespace: tst-namespace
+  labels:
+    app: webapp
+spec:
+  # <- по результатам нагрузочного теста известно, что 4 пода справляются с пиковой нагрузкой
+  # <- хотим максимально отказоустойчивый deployment
+  # <- хотим минимального потребления ресурсов от этого deployment’а
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+    spec:
+      # <- у нас мультизональный кластер (три зоны), в котором пять нод
+      affinity:
+        # 1. Хотим распределять по нодам в рамках одной AZ так, чтобы Pod-ы старались попасть на разные ноды
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - webapp
+            topologyKey: kubernetes.io/hostname
+        # 2. Хотим распределять Pod-ы по AZ равномерно
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - webapp
+              topologyKey: topology.kubernetes.io/region
+          
+      containers:
+      - name: nginx
+        image: nginx:1.23.4
+
+        # на первые запросы приложению требуется значительно больше ресурсов CPU
+        # в дальнейшем потребление ровное в районе 0.1 CPU. По памяти всегда “ровно” в районе 128M memory
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "1000m"
+
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+            httpHeaders:
+            - name: Custom-Header
+              value: Awesome
+          initialDelaySeconds: 3
+          periodSeconds: 2
+
+        readinessProbe:
+          exec:
+            command:
+            - cat
+            - /tmp/healthy
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: liveness-port
+          failureThreshold: 30
+          periodSeconds: 10  # <- приложение требует около 5-10 секунд для инициализации
